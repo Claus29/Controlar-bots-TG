@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import subprocess
-import sys
 import threading
 import time
 from collections import deque
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -18,16 +17,16 @@ from typing import Callable
 
 import psutil
 
-from botcontrol import scanner
+from botcontrol import deps, scanner
 from botcontrol.launcher import IS_WINDOWS, LaunchError, build_launch
 from botcontrol.models import AppConfig, BotConfig
+from botcontrol.proc_utils import (
+    CREATE_BREAKAWAY_FROM_JOB, Cancelled, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, default_dll_search,
+)
 from botcontrol.storage import read_json, write_json_atomic
 
 log = logging.getLogger(__name__)
 
-CREATE_NEW_PROCESS_GROUP = 0x00000200
-CREATE_NO_WINDOW = 0x08000000
-CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
 class State(str, Enum):
@@ -74,6 +73,10 @@ class Runtime:
     cpu: float = 0.0
     memory: int = 0
     procs: dict = field(default_factory=dict)
+    busy: bool = False  # instalando librerías
+    skip_sync: bool = False  # las librerías ya se acaban de instalar
+    dep_attempts: set = field(default_factory=set)  # módulos que ya se intentó instalar
+    cancel: threading.Event | None = None
 
     @property
     def is_active(self) -> bool:
@@ -99,6 +102,7 @@ class BotManager:
         self.runtimes: dict[str, Runtime] = {}
         self._lock = threading.RLock()
         self._snapshot: tuple[float, list[dict]] | None = None
+        self._calls: queue.SimpleQueue = queue.SimpleQueue()  # trabajo de hilos para el hilo principal
 
     # ------------------------------------------------------------------ util
     def runtime(self, bot_id: str) -> Runtime:
@@ -211,7 +215,18 @@ class BotManager:
         rt.pending_start_at = None
         rt.message = message
         rt.procs = {}
+        self._remember_interpreter(bot_id, pid)
         self._emit(bot_id, "adopted", message)
+
+    def _remember_interpreter(self, bot_id: str, pid: int) -> None:
+        """Guarda el Python con el que se ejecutaba el bot adoptado para reiniciarlo con el mismo."""
+        bot = self.config.get(bot_id)
+        if bot is None or bot.kind not in ("python", "node") or bot.interpreter.strip():
+            return
+        interpreter = scanner.interpreter_of(pid, bot.kind)
+        if interpreter:
+            bot.interpreter = interpreter
+            self._emit(bot_id, "config_changed", f"Intérprete detectado: {interpreter}")
 
     def adopt(self, bot_id: str, pid: int) -> None:
         self._attach(bot_id, pid, external=True, message=f"Adoptado (PID {pid})")
@@ -233,13 +248,16 @@ class BotManager:
             pid = scanner.find_process_for(bot, self._processes(), exclude=own)
         return pid
 
-    def start(self, bot_id: str, reason: str = "manual", check_duplicates: bool = True) -> None:
+    def start(self, bot_id: str, reason: str = "manual", check_duplicates: bool = True,
+              skip_sync: bool = False) -> None:
         bot = self.config.get(bot_id)
         if bot is None:
             raise LaunchError("El bot no existe.")
         rt = self.runtime(bot_id)
-        if rt.is_active:
+        if rt.is_active or rt.busy:
             return
+        if reason == "manual":
+            rt.dep_attempts.clear()
         if check_duplicates:
             pid = self.find_duplicate(bot)
             if pid:
@@ -254,6 +272,11 @@ class BotManager:
             self._note(bot_id, f"No se pudo iniciar: {exc}")
             self._emit(bot_id, "error", str(exc))
             raise
+
+        if not skip_sync and deps.needs_sync(bot):
+            self._rotate_log(bot_id)
+            self._start_deps_job(bot, "sync", reason)
+            return
 
         self._rotate_log(bot_id)
         log_file = open(self.log_path(bot_id), "ab")
@@ -299,7 +322,7 @@ class BotManager:
         )
         if IS_WINDOWS:
             flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-            with _default_dll_search():
+            with default_dll_search():
                 try:
                     # Fuera del "job" de BotControl: el bot sobrevive si se cierra la app.
                     return subprocess.Popen(spec.command, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kwargs)
@@ -320,6 +343,8 @@ class BotManager:
     def stop(self, bot_id: str, timeout: float = 8.0, restart: bool = False) -> None:
         rt = self.runtime(bot_id)
         if rt.state == State.WAITING or (not rt.is_active and rt.pending_start_at):
+            if rt.cancel is not None:
+                rt.cancel.set()
             rt.pending_start_at = None
             rt.state = State.STOPPED
             rt.message = "Inicio cancelado"
@@ -366,7 +391,19 @@ class BotManager:
             return code is None, code
         return self._pid_matches(rt.pid, rt.create_time) if rt.pid else False, None
 
+    def _call_soon(self, func: Callable[[], None]) -> None:
+        self._calls.put(func)
+
     def poll(self, update_stats: bool = True) -> None:
+        while True:
+            try:
+                func = self._calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func()
+            except Exception:  # noqa: BLE001
+                log.exception("Error al terminar una tarea en segundo plano")
         now = time.monotonic()
         changed = False
         for bot in list(self.config.bots):
@@ -374,8 +411,9 @@ class BotManager:
             if rt.pending_start_at is not None and not rt.is_active and now >= rt.pending_start_at:
                 reason = rt.pending_reason or "programado"
                 rt.pending_start_at = None
+                skip, rt.skip_sync = rt.skip_sync, False
                 try:
-                    self.start(bot.id, reason=reason, check_duplicates=True)
+                    self.start(bot.id, reason=reason, check_duplicates=True, skip_sync=skip)
                 except AlreadyRunning as exc:
                     self.adopt(bot.id, exc.pid)
                 except LaunchError:
@@ -426,6 +464,8 @@ class BotManager:
 
         rt.state = State.CRASHED
         self._note(bot.id, f"El proceso se cerró inesperadamente{code_text}")
+        if self._handle_missing_module(bot, rt):
+            return
         if not bot.auto_restart:
             rt.message = f"Se cerró{code_text}"
             self._emit(bot.id, "crashed", f"Se ha caído{code_text}")
@@ -447,6 +487,107 @@ class BotManager:
         rt.message = f"Caído{code_text}; reinicio en {delay} s"
         self._emit(bot.id, "crashed", f"Se ha caído{code_text}; se reiniciará en {delay} s")
 
+    # ----------------------------------------------------------- librerías
+    def _log_since_start(self, bot_id: str) -> str:
+        try:
+            with open(self.log_path(bot_id), "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - 64 * 1024))
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        marker = text.rfind("===== [BotControl")
+        return text[marker:] if marker >= 0 else text
+
+    def _handle_missing_module(self, bot: BotConfig, rt: Runtime) -> bool:
+        """Si el bot se cayó porque le falta una librería, la instala y lo reinicia."""
+        if bot.kind not in ("python", "node"):
+            return False
+        module = deps.missing_module_from_log(self._log_since_start(bot.id), bot.kind)
+        if not module:
+            return False
+        package = deps.pip_name(module) if bot.kind == "python" else module
+        if deps.is_local_module(bot, module):
+            rt.state = State.FAILED
+            rt.message = f"Falta el módulo propio «{module}» (no es una librería instalable)"
+            self._emit(bot.id, "missing_module", rt.message)
+            return True
+        if not bot.auto_install or module in rt.dep_attempts:
+            rt.state = State.FAILED
+            done = " (ya se intentó instalar)" if module in rt.dep_attempts else ""
+            rt.message = f"Falta la librería «{package}»{done}"
+            self._emit(bot.id, "missing_module", f"Falta la librería «{package}» en su Python{done}. "
+                                                  "Ábrelo en «Librerías» para instalarla.")
+            return True
+        rt.dep_attempts.add(module)
+        self._emit(bot.id, "deps", f"Falta la librería «{package}»: instalándola…")
+        self._start_deps_job(bot, "missing", "reinicio tras instalar librerías", module)
+        return True
+
+    def _start_deps_job(self, bot: BotConfig, job: str, reason: str, module: str = "") -> None:
+        rt = self.runtime(bot.id)
+        rt.state = State.WAITING
+        rt.busy = True
+        rt.pending_start_at = None
+        rt.cancel = threading.Event()
+        cancel = rt.cancel
+        what = f"«{deps.pip_name(module) if bot.kind == 'python' else module}»" if module else "las librerías"
+        rt.message = f"Instalando {what}…"
+        self._note(bot.id, f"Instalando {what} en el entorno del bot…")
+        snapshot = BotConfig.from_dict(bot.to_dict())
+        log_path = self.log_path(bot.id)
+
+        def work():
+            result, error = None, None
+            try:
+                with open(log_path, "a", encoding="utf-8", errors="replace") as fh:
+                    def on_line(line: str) -> None:
+                        fh.write(line + "\n")
+                        fh.flush()
+
+                    if job == "sync":
+                        result = deps.sync(snapshot, on_line, cancel)
+                    else:
+                        result = deps.install_missing(snapshot, module, on_line, cancel)
+            except Exception as exc:  # noqa: BLE001 - se informa al usuario
+                error = exc
+            self._call_soon(lambda: self._deps_done(snapshot.id, job, reason, result, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _deps_done(self, bot_id: str, job: str, reason: str, result, error) -> None:
+        rt = self.runtime(bot_id)
+        rt.busy = False
+        rt.cancel = None
+        bot = self.config.get(bot_id)
+        if bot is None:
+            return
+        if isinstance(error, Cancelled):
+            self._note(bot_id, "Instalación de librerías cancelada")
+            return
+        if error is not None and job == "missing":
+            rt.state = State.FAILED
+            rt.message = f"Error instalando librerías: {error}"
+            self._note(bot_id, rt.message)
+            self._emit(bot_id, "missing_module", rt.message)
+            return
+        if error is not None:
+            # Puede que ya esté todo instalado (p. ej. sin Internet al encender el PC): se inicia igualmente.
+            self._note(bot_id, f"No se pudieron comprobar las librerías ({error}); se inicia igualmente")
+            self._emit(bot_id, "deps_failed", f"No se pudieron instalar sus librerías: {error}. Se inicia igualmente.")
+        elif job == "sync":
+            bot.deps_hash = result or ""
+            self._emit(bot_id, "config_changed", "Librerías al día")
+        else:
+            self._emit(bot_id, "deps_installed", f"Librería «{result}» instalada; reiniciando el bot")
+        if error is None:
+            self._note(bot_id, "Librerías instaladas correctamente")
+        if rt.state != State.WAITING:  # el usuario lo detuvo mientras se instalaba
+            return
+        rt.skip_sync = job == "sync"
+        rt.pending_start_at = time.monotonic()
+        rt.pending_reason = reason
+
     def _update_stats(self, rt: Runtime) -> None:
         try:
             root = rt.procs.get(rt.pid) or psutil.Process(rt.pid)
@@ -465,23 +606,6 @@ class BotManager:
         rt.procs = current
         rt.cpu = cpu / (psutil.cpu_count() or 1)
         rt.memory = mem
-
-
-@contextmanager
-def _default_dll_search():
-    """Evita que los bots hereden la carpeta de DLLs del ejecutable empaquetado (PyInstaller)."""
-    meipass = getattr(sys, "_MEIPASS", None)
-    if not (IS_WINDOWS and getattr(sys, "frozen", False) and meipass):
-        yield
-        return
-    import ctypes
-
-    kernel32 = ctypes.windll.kernel32
-    kernel32.SetDllDirectoryW(None)
-    try:
-        yield
-    finally:
-        kernel32.SetDllDirectoryW(meipass)
 
 
 def kill_tree(pid: int, timeout: float = 8.0) -> None:

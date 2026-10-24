@@ -27,6 +27,10 @@ programarlos por horario y elegir cuáles se abren solos al encender el PC.
   `409 Conflict` de Telegram).
 - **Token** opcional: se guarda cifrado con tu cuenta de Windows (DPAPI), se puede pasar al
   bot como variable de entorno y se comprueba contra Telegram para mostrar su `@usuario`.
+- **Librerías gestionadas automáticamente**: instala el `requirements.txt` del bot y, si se
+  cae por `No module named '...'`, instala la librería que falta y lo reinicia solo.
+- **Entorno aislado por bot** (un clic): cada bot con sus propias librerías y versiones, sin
+  romper a los demás.
 - Admite bots en **Python** (detecta su `venv`/`.venv`), **Node.js**, **ejecutables** o
   **cualquier comando**.
 - Si cierras BotControl puedes **dejar los bots funcionando**; al volver a abrirlo los
@@ -65,6 +69,29 @@ en su carpeta, se usa automáticamente.
 Atajos: `Ctrl+N` añadir · `F5` detectar · `Ctrl+R` iniciar · `Ctrl+T` detener ·
 `Ctrl+Shift+R` reiniciar · `Ctrl+E` editar · `Supr` eliminar · `Ctrl+Q` salir.
 
+### Librerías de tus bots
+
+Cada bot usa las librerías **del Python con el que se ejecuta** (BotControl no las lleva
+dentro). Para que nunca falten:
+
+- **Automático** (activado por defecto, pestaña *Librerías* al editar el bot):
+  - Antes de iniciar, si cambió el `requirements.txt` (o `package.json`) o las *librerías
+    adicionales*, se instalan.
+  - Si el bot se cae con `ModuleNotFoundError: No module named 'X'`, BotControl busca el
+    paquete correcto (p. ej. `cv2 → opencv-python`, `PIL → Pillow`,
+    `telebot → pyTelegramBotAPI`), lo instala y reinicia el bot. Un intento por librería.
+- **Botón «Librerías»** (`Ctrl+L`) de la ventana principal:
+  - **Analizar librerías del bot**: lee sus `import` y te dice cuáles faltan.
+  - **Añadir librería**: escribe `matplotlib` o `pandas==2.2.2` y pulsa *Instalar*;
+    puedes guardarla como librería del bot para que se compruebe siempre.
+  - Ver las instaladas, desinstalar e instalar el `requirements.txt`.
+  - **Crear entorno aislado (recomendado)**: crea un `.venv` sólo para ese bot con todo lo que
+    necesita. Así las librerías o versiones de un bot no afectan a los demás.
+- Al editar un bot puedes elegir el Python en **«Pythons instalados ▾»**.
+
+Las variables de entorno del bot (pestaña *Avanzado*) también se aplican a `pip`, por ejemplo
+`PIP_INDEX_URL` para un repositorio privado.
+
 ### Dónde se guardan los datos
 
 `%APPDATA%\BotControl\`
@@ -75,6 +102,12 @@ Atajos: `Ctrl+N` añadir · `F5` detectar · `Ctrl+R` iniciar · `Ctrl+T` detene
 - `botcontrol.log` — registro del propio programa.
 
 ## Preguntas frecuentes
+
+**Sale `ModuleNotFoundError: No module named 'matplotlib'` (u otra librería).** Al Python
+que usa ese bot le falta la librería. Con *Gestionar las librerías automáticamente* activado,
+BotControl la instala y reinicia el bot solo. Si quieres hacerlo a mano: selecciona el bot →
+**Librerías** → escribe `matplotlib` → **Instalar**. Si varios bots comparten el mismo Python
+y chocan entre sí, pulsa **Crear entorno aislado**.
 
 **¿Cómo detecta que un proceso es un bot de Telegram?** Mira los procesos de Python/Node y
 revisa si su script usa `python-telegram-bot`, `aiogram`, `pyTelegramBotAPI (telebot)`,
@@ -126,6 +159,8 @@ botcontrol/
   models.py           bots, programación y ajustes
   storage.py          guardado atómico de la configuración, exportar/importar
   launcher.py         línea de comandos de cada bot (venv, Python, Node…)
+  deps.py             librerías: análisis de imports, pip/npm, entornos aislados
+  proc_utils.py       procesos sin ventana (bots, pip)
   process_manager.py  iniciar/detener/adoptar, reinicio automático, CPU/RAM
   scanner.py          detección de bots en procesos y carpetas
   scheduler.py        programación horaria
@@ -136,4 +171,5 @@ botcontrol/
 installer/            script de Inno Setup
 tests/                pruebas automáticas
 docs/PROMPT.md        especificación completa del programa
+docs/PROMPT-2-librerias.md  especificación de la gestión de librerías
 ```

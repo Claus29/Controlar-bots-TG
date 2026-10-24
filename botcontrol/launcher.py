@@ -133,7 +133,11 @@ def build_env(bot: BotConfig, base: dict[str, str] | None = None) -> dict[str, s
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    env["FORCE_COLOR"] = "0"
+    # Sin colores en la salida (el registro es un archivo). Ojo: FORCE_COLOR los *activa*
+    # con cualquier valor en Python 3.13+, así que se quita.
+    env.pop("FORCE_COLOR", None)
+    env["NO_COLOR"] = "1"
+    env["PYTHON_COLORS"] = "0"
     env.update(bot.env)
     if bot.inject_token and bot.token_env.strip():
         token = secrets.unprotect(bot.token_enc)

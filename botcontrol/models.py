@@ -77,6 +77,9 @@ class BotConfig:
     max_restarts: int = 5
     restart_window: int = 600  # segundos
     schedule: Schedule = field(default_factory=Schedule)
+    auto_install: bool = True  # instalar requirements/librerías que falten automáticamente
+    extra_packages: list[str] = field(default_factory=list)  # librerías adicionales (sintaxis pip/npm)
+    deps_hash: str = ""  # huella de la última instalación correcta de librerías
     notes: str = ""
     id: str = field(default_factory=new_id)
 
@@ -87,6 +90,7 @@ class BotConfig:
         bot = cls(**_filter_kwargs(cls, data))
         bot.schedule = schedule
         bot.env = {str(k): str(v) for k, v in (bot.env or {}).items()}
+        bot.extra_packages = [str(p).strip() for p in (bot.extra_packages or []) if str(p).strip()]
         if bot.kind not in KINDS:
             bot.kind = "python"
         if not bot.id:

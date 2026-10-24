@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QTime
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout,
+    QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QTimeEdit, QVBoxLayout,
     QWidget,
 )
 
@@ -74,6 +74,7 @@ class BotDialog(QDialog):
         tabs.addTab(self._telegram_tab(), "Telegram")
         tabs.addTab(self._start_tab(), "Inicio y reinicio")
         tabs.addTab(self._schedule_tab(), "Programación")
+        tabs.addTab(self._libraries_tab(), "Librerías")
         tabs.addTab(self._advanced_tab(), "Avanzado")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -110,6 +111,13 @@ class BotDialog(QDialog):
         self.interpreter.setPlaceholderText("Autodetectar (venv del bot o Python del sistema)")
         self.interpreter.editingFinished.connect(self._update_detected)
         self.interp_row = path_row(self.interpreter, self._browse_interpreter)
+        self.pythons_button = QPushButton("Pythons instalados ▾")
+        self.pythons_button.setToolTip("Elegir uno de los Pythons instalados en este PC")
+        self.pythons_menu = QMenu(self.pythons_button)
+        self.pythons_menu.aboutToShow.connect(self._load_pythons)
+        self.pythons_button.setMenu(self.pythons_menu)
+        self.interp_row.layout().addWidget(self.pythons_button)
+        self._pythons_loaded = False
         self.interp_label = QLabel("Intérprete")
         self.detected = hint("")
         self.target_hint = hint("")
@@ -215,6 +223,53 @@ class BotDialog(QDialog):
         layout.addStretch(1)
         return page
 
+    def _libraries_tab(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+        self.auto_install = QCheckBox("Gestionar las librerías automáticamente")
+        self.auto_install.setChecked(self.bot.auto_install)
+        self.extra_packages = QPlainTextEdit("\n".join(self.bot.extra_packages))
+        self.extra_packages.setPlaceholderText("matplotlib\npandas==2.2.2\nrequests>=2.31")
+        self.extra_packages.setFixedHeight(130)
+        form.addRow("", self.auto_install)
+        form.addRow("", hint(
+            "Antes de iniciar el bot se instala su requirements.txt (o package.json) si ha cambiado, y si el bot "
+            "se cae porque le falta una librería («No module named …»), BotControl la instala en su Python y lo "
+            "reinicia solo."))
+        form.addRow("Librerías adicionales", self.extra_packages)
+        form.addRow("", hint(
+            "Una por línea, como en pip (o npm para bots de Node). Se comprueban cada vez que cambian. Para ver, "
+            "analizar o instalar librerías y crear un entorno aislado, usa el botón «Librerías» de la ventana "
+            "principal."))
+        return page
+
+    def _load_pythons(self) -> None:
+        if self._pythons_loaded:
+            return
+        self._pythons_loaded = True
+        self.pythons_menu.clear()
+        self.pythons_menu.addAction("Buscando Pythons instalados…").setEnabled(False)
+
+        def done(found, error):
+            self.pythons_menu.clear()
+            auto = self.pythons_menu.addAction("Autodetectar (venv del bot o Python del sistema)")
+            auto.triggered.connect(lambda: self._choose_python(""))
+            self.pythons_menu.addSeparator()
+            for install in found or []:
+                action = self.pythons_menu.addAction(install.label)
+                action.triggered.connect(lambda _=False, p=install.path: self._choose_python(p))
+            if error or not found:
+                self.pythons_menu.addAction("No se encontró ningún Python").setEnabled(False)
+            self.pythons_menu.adjustSize()
+
+        from botcontrol.deps import find_pythons
+
+        run_async(find_pythons, done, self)
+
+    def _choose_python(self, path: str) -> None:
+        self.interpreter.setText(path)
+        self._update_detected()
+
     def _advanced_tab(self) -> QWidget:
         page = QWidget()
         form = QFormLayout(page)
@@ -247,6 +302,7 @@ class BotDialog(QDialog):
         self.interp_row.setVisible(needs_interp)
         self.interp_label.setVisible(needs_interp)
         self.detected.setVisible(needs_interp)
+        self.pythons_button.setVisible(self.kind_key == "python")
         self.target_hint.setText("Se ejecuta tal cual en la consola de Windows (cmd), sin ventana.")
         self.target_hint.setVisible(is_command)
         self._update_detected()
@@ -336,6 +392,11 @@ class BotDialog(QDialog):
         bot.schedule.stop = self.sched_stop.time().toString("HH:mm")
         bot.env = parse_env(self.env.toPlainText())
         bot.notes = self.notes.toPlainText().strip()
+        bot.auto_install = self.auto_install.isChecked()
+        bot.extra_packages = [p.strip() for p in self.extra_packages.toPlainText().splitlines()
+                              if p.strip() and not p.strip().startswith("#")]
+        if bot.interpreter != self.bot.interpreter or bot.target != self.bot.target:
+            bot.deps_hash = ""  # otro Python u otro script: volver a comprobar sus librerías
         return bot
 
     def _show_preview(self) -> None:

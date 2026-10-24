@@ -60,3 +60,8 @@ def test_token_injection():
     assert build_env(bot, {})["TOKEN"] == "1:x"
     bot.inject_token = False
     assert "TOKEN" not in build_env(bot, {})
+
+
+def test_env_disables_colors():
+    env = build_env(BotConfig(name="b"), {"FORCE_COLOR": "1"})
+    assert "FORCE_COLOR" not in env and env["NO_COLOR"] == "1" and env["PYTHON_COLORS"] == "0"

@@ -107,3 +107,19 @@ def test_scheduled_start(tmp_path):
     finally:
         mgr.stop(bot.id)
         mgr.wait_all_stopped(10)
+
+
+def test_adopting_remembers_real_interpreter(tmp_path):
+    """Causa del «No module named …»: al adoptar un bot hay que guardar su Python real."""
+    import os
+
+    mgr, bot, events = make(tmp_path, LOOP)
+    bot.interpreter = ""
+    external = subprocess.Popen([sys.executable, bot.target], cwd=str(tmp_path))
+    try:
+        assert wait(lambda: mgr.find_duplicate(bot) == external.pid)
+        assert mgr.recover() == [bot.id]
+        assert bot.interpreter and os.path.samefile(bot.interpreter, sys.executable)
+        assert "config_changed" in [e[1] for e in events]
+    finally:
+        kill_tree(external.pid, 2)

@@ -71,13 +71,14 @@ class Candidate:
             name=self.name,
             kind=self.kind,
             target=self.script,
-            interpreter="",
+            # Mismo Python con el que ya funcionaba: así no faltan sus librerías al reiniciarlo.
+            interpreter=self.interpreter if interpreter_kind(self.interpreter) == self.kind else "",
             workdir=self.cwd if self.cwd and norm(self.cwd) != norm(Path(self.script).parent) else "",
             args=self.args,
         )
 
 
-def _interpreter_kind(exe_or_name: str) -> str | None:
+def interpreter_kind(exe_or_name: str) -> str | None:
     name = Path(exe_or_name).name.lower()
     for suffix in (".exe",):
         if name.endswith(suffix):
@@ -93,7 +94,7 @@ def script_from_cmdline(cmdline: list[str], cwd: str = "") -> tuple[str, str, li
     """Devuelve ``(tipo, script, argumentos)`` si el proceso ejecuta un script."""
     if not cmdline:
         return None
-    kind = _interpreter_kind(cmdline[0])
+    kind = interpreter_kind(cmdline[0])
     if not kind:
         return None
     extensions = PY_EXT if kind == "python" else JS_EXT
@@ -121,7 +122,7 @@ def _proc_info(proc: psutil.Process) -> dict | None:
                 "cmdline": cmdline,
                 "exe": _safe(proc.exe),
                 # La carpeta sólo hace falta para resolver scripts con ruta relativa.
-                "cwd": _safe(proc.cwd) if _interpreter_kind(cmdline[0]) else "",
+                "cwd": _safe(proc.cwd) if interpreter_kind(cmdline[0]) else "",
                 "create_time": proc.create_time(),
             }
     except (psutil.Error, OSError):
@@ -168,8 +169,10 @@ def find_running_bots(processes: list[dict] | None = None, only_telegram: bool =
         info = dict(info, kind=kind, script=script, args=args, telegram=telegram)
         matches.append(info)
 
+    children = {m["ppid"]: m for m in matches}
     candidates = []
     for info in _topmost(matches):
+        real = _real_interpreter(info, children.get(info["pid"]))
         candidates.append(
             Candidate(
                 kind=info["kind"],
@@ -177,13 +180,48 @@ def find_running_bots(processes: list[dict] | None = None, only_telegram: bool =
                 name=guess_name(info["script"]),
                 is_telegram=info["telegram"],
                 pid=info["pid"],
-                interpreter=info["exe"] or info["cmdline"][0],
+                interpreter=real,
                 cwd=info["cwd"],
                 args=" ".join(_quote(a) for a in info["args"]),
                 cmdline=" ".join(info["cmdline"]),
             )
         )
     return candidates
+
+
+LAUNCHERS = ("py", "pyw", "py.exe", "pyw.exe")
+
+
+def _real_interpreter(info: dict, child: dict | None) -> str:
+    """Ejecutable de Python que de verdad corre el bot.
+
+    El lanzador ``py.exe`` arranca un ``python.exe`` hijo: ése es el bueno. En cambio, el
+    ``python.exe`` de un venv también crea un hijo (el Python base), pero hay que quedarse
+    con el del venv, que es el que tiene las librerías del bot.
+    """
+    exe = info["exe"] or info["cmdline"][0]
+    if Path(exe).name.lower() in LAUNCHERS and child is not None:
+        return child["exe"] or child["cmdline"][0]
+    return exe
+
+
+def interpreter_of(pid: int, kind: str) -> str:
+    """Intérprete real de un proceso en ejecución (vacío si no es del tipo esperado)."""
+    try:
+        proc = psutil.Process(pid)
+        info = _proc_info(proc)
+        if info is None:
+            return ""
+        child = None
+        for sub in proc.children():
+            sub_info = _proc_info(sub)
+            if sub_info and interpreter_kind(sub_info["cmdline"][0]):
+                child = sub_info
+                break
+    except (psutil.Error, OSError):
+        return ""
+    exe = _real_interpreter(info, child)
+    return exe if interpreter_kind(exe) == kind else ""
 
 
 def _quote(arg: str) -> str:

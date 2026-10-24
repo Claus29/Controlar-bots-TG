@@ -35,7 +35,8 @@ log = logging.getLogger(__name__)
 COLUMNS = ["Estado", "Nombre", "Telegram", "Inicio auto", "Programación", "PID", "Activo", "CPU", "RAM",
            "Reinicios"]
 COL_STATE, COL_NAME, COL_TG, COL_AUTO, COL_SCHED, COL_PID, COL_UP, COL_CPU, COL_RAM, COL_RESTARTS = range(10)
-ALERT_EVENTS = {"crashed", "gave_up", "error"}
+ALERT_EVENTS = {"crashed", "gave_up", "error", "missing_module", "deps_failed"}
+INFO_EVENTS = {"deps", "deps_installed"}
 
 
 def fmt_uptime(seconds: float) -> str:
@@ -159,6 +160,7 @@ class MainWindow(QMainWindow):
         self.tracker = ScheduleTracker()
         self.launched_at_boot = launched_at_boot
         self._quitting = False
+        self._lib_prompts: set[str] = set()
 
         self.setWindowTitle(f"{APP_NAME} — Control de bots de Telegram")
         self.setWindowIcon(app_icon())
@@ -251,6 +253,9 @@ class MainWindow(QMainWindow):
         self.act_duplicate = self._action("Duplicar", None, self.duplicate_selected)
         self.act_delete = self._action("Eliminar", "SP_TrashIcon", self.delete_selected, "Del")
         self.act_folder = self._action("Abrir carpeta del bot", "SP_DirIcon", self.open_bot_folder)
+        self.act_libs = self._action("Librerías…", "SP_DriveHDIcon", self.open_libraries, "Ctrl+L",
+                                     "Ver, analizar e instalar las librerías del bot, o crearle un entorno aislado",
+                                     short="Librerías")
         self.act_telegram = self._action("Abrir en Telegram", None, self.open_in_telegram)
         self.act_start_all = self._action("Iniciar todos", "SP_MediaSeekForward", self.start_all)
         self.act_stop_all = self._action("Detener todos", "SP_MediaPause", self.stop_all)
@@ -270,7 +275,8 @@ class MainWindow(QMainWindow):
         for action in (self.act_add, self.act_detect, self.act_scan):
             bar.addAction(action)
         bar.addSeparator()
-        for action in (self.act_start, self.act_stop, self.act_restart, self.act_edit, self.act_delete):
+        for action in (self.act_start, self.act_stop, self.act_restart, self.act_edit, self.act_libs,
+                       self.act_delete):
             bar.addAction(action)
         bar.addSeparator()
         bar.addAction(self.act_start_all)
@@ -399,6 +405,7 @@ class MainWindow(QMainWindow):
         self.act_edit.setEnabled(single)
         self.act_duplicate.setEnabled(single)
         self.act_folder.setEnabled(single)
+        self.act_libs.setEnabled(single and selected[0].kind in ("python", "node"))
         self.act_telegram.setEnabled(single and bool(selected[0].username))
         self.act_delete.setEnabled(bool(selected))
         self.act_start_all.setEnabled(bool(self.config.bots))
@@ -412,8 +419,30 @@ class MainWindow(QMainWindow):
         bot = self.config.get(bot_id)
         name = bot.name if bot else bot_id
         self.statusBar().showMessage(f"{name}: {message}", 8000)
+        if kind == "config_changed":
+            self.save()
+            return
         if kind in ALERT_EVENTS and self.config.settings.notify_crash and self.tray:
             self.tray.showMessage(f"{name}", message, QSystemTrayIcon.Warning, 8000)
+        elif kind in INFO_EVENTS and self.tray and not self.isVisible():
+            self.tray.showMessage(f"{name}", message, QSystemTrayIcon.Information, 5000)
+        if kind == "missing_module" and bot and self.isVisible():
+            # Diferido: no abrir diálogos modales dentro del sondeo de procesos.
+            QTimer.singleShot(0, lambda: self._offer_libraries(bot_id, message))
+
+    def _offer_libraries(self, bot_id: str, message: str) -> None:
+        bot = self.config.get(bot_id)
+        if bot is None or bot_id in self._lib_prompts:
+            return
+        self._lib_prompts.add(bot_id)
+        try:
+            answer = QMessageBox.question(
+                self, f"Librerías de «{bot.name}»",
+                f"{message}\n\n¿Abrir el gestor de librerías del bot para solucionarlo?")
+        finally:
+            self._lib_prompts.discard(bot_id)
+        if answer == QMessageBox.Yes:
+            self.open_libraries(bot)
 
     def check_schedules(self) -> None:
         for bot_id, action in self.tracker.evaluate(self.config.bots, datetime.now()):
@@ -458,6 +487,32 @@ class MainWindow(QMainWindow):
                 self.manager.adopt(bot.id, exc.pid)
         except LaunchError as exc:
             QMessageBox.warning(self, f"No se pudo iniciar «{bot.name}»", str(exc))
+
+    def start_bot(self, bot: BotConfig) -> None:
+        self.manager.runtime(bot.id).restart_times.clear()
+        self._start(bot)
+        self.tick()
+
+    def restart_bot(self, bot: BotConfig) -> None:
+        try:
+            self.manager.restart(bot.id)
+        except (LaunchError, AlreadyRunning) as exc:
+            QMessageBox.warning(self, f"No se pudo reiniciar «{bot.name}»", str(exc))
+        self.tick()
+
+    def open_libraries(self, bot: BotConfig | None = None) -> None:
+        if not isinstance(bot, BotConfig):
+            selected = self.selected_bots()
+            if len(selected) != 1:
+                return
+            bot = selected[0]
+        if bot.kind not in ("python", "node"):
+            QMessageBox.information(self, "Librerías", "La gestión de librerías es para bots de Python o Node.js.")
+            return
+        from botcontrol.ui.deps_dialog import DepsDialog
+
+        DepsDialog(bot, self).exec()
+        self.model.refresh()
 
     def start_selected(self) -> None:
         for bot in self.selected_bots():
@@ -596,7 +651,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         if self.selected_bots():
             for action in (self.act_start, self.act_stop, self.act_restart, None, self.act_edit,
-                           self.act_duplicate, self.act_folder, self.act_telegram, None, self.act_delete):
+                           self.act_libs, self.act_duplicate, self.act_folder, self.act_telegram, None,
+                           self.act_delete):
                 menu.addSeparator() if action is None else menu.addAction(action)
         else:
             menu.addAction(self.act_add)
@@ -662,6 +718,8 @@ class MainWindow(QMainWindow):
                 names.add(bot.name)
                 self.config.bots.append(bot)
                 by_script[scanner.norm(cand.script)] = bot
+            if not bot.interpreter and cand.interpreter and scanner.interpreter_kind(cand.interpreter) == bot.kind:
+                bot.interpreter = cand.interpreter  # el mismo Python con el que ya funcionaba
             if adopt and cand.pid and not self.manager.runtime(bot.id).is_active:
                 try:
                     self.manager.adopt(bot.id, cand.pid)

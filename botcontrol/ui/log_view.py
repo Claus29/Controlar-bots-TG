@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, QUrl
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")  # códigos de color de la consola
 INITIAL_BYTES = 256 * 1024
 MAX_LINES = 5000
 
@@ -95,7 +97,7 @@ class LogView(QWidget):
         except OSError:
             return
         self.offset += len(data)
-        text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        text = ANSI.sub("", data.decode("utf-8", errors="replace")).replace("\r\n", "\n").replace("\r", "\n")
         if skip_partial and "\n" in text:
             text = text.split("\n", 1)[1]
         self._append(text)

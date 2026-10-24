@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+.build-venv/
+.venv/
+venv/
+installer/version_info.txt
+*.spec.bak
